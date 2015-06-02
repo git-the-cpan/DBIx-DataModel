@@ -538,14 +538,18 @@ sub row_count {
       splice @bind, -2;
     }
 
-    # select COUNT(*) instead of initial columns
-    if ($sql =~ /\b(UNION|INTERSECT|MINUS|EXCEPT)\b/) {
-      $sql = "SELECT COUNT(*) FROM ( $sql )";
-    }
-    else {
-      $sql =~ s[^SELECT\b.*?\bFROM\b][SELECT COUNT(*) FROM]i
-        or croak "can't count rows from sql: $sql";
-    }
+    # decide if the SELECT COUNT should wrap the original SQL in a subquery;
+    # this is needed with clauses like below that change the number of rows
+    my $should_wrap = $sql =~ /\b(UNION|INTERSECT|MINUS|EXCEPT|DISTINCT)\b/i;
+
+    # if no wrap required, attempt to directly substitute COUNT(*) for the 
+    # column names ...but if it fails, wrap anyway
+    $should_wrap ||= ! ($sql =~ s[^SELECT\b.*?\bFROM\b][SELECT COUNT(*) FROM]i);
+
+    # wrap SQL if needed, using  a subquery alias because it's required for 
+    # some DBMS (like PostgreSQL)
+    $should_wrap and  $sql = "SELECT COUNT(*) FROM "
+                           . $sqla->table_alias("( $sql )", "count_wrapper");
 
     # log the statement and bind values
     $self->schema->_debug("PREPARE $sql / @bind");
@@ -696,7 +700,11 @@ sub _compute_from_DB_handlers {
   # iterate over aliased_columns
   while (my ($alias, $column) = each %{$self->{aliased_columns} || {}}) {
     my $table_name;
-    $column =~ s/^([^()]+)\.// and $table_name = $1;
+    $column =~ s{^([^()]+)     # supposed table name (without parens)
+                  \.           # followed by a dot
+                  (?=[^()]+$)  # followed by supposed col name (without parens)
+                }{}x
+      and $table_name = $1;
     if (!$table_name) {
       $handlers{$alias} = $handlers{$column};
     }
